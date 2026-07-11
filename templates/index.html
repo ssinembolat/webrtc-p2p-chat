@@ -1,0 +1,290 @@
+
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebRTC Görüntülü Sohbet</title>
+    <style>
+        body {
+            margin: 0; background-color: #202124; font-family: 'Segoe UI', sans-serif;
+            color: white; overflow: hidden; display: flex; flex-direction: column; height: 100vh;
+        }
+        #video-container {
+            flex-grow: 1; position: relative; display: flex; justify-content: center; align-items: center;
+            background: radial-gradient(circle, #303134 0%, #202124 100%);
+        }
+        
+        /* Karşı Taraf - Her zaman arka planda tam ekran */
+        #remoteVideo { 
+            width: 100%; height: 100%; object-fit: cover; position: absolute; z-index: 1;
+        }
+        
+        /* BAŞLANGIÇTA: Kendi görüntün (Kimse bağlı değilken tam ekran) */
+        #localVideo {
+            width: 100%; height: 100%; object-fit: cover; position: absolute;
+            transform: scaleX(-1); /* Ayna efekti */
+            transition: all 0.5s ease-in-out; /* Küçülürken akıcı animasyon olsun diye */
+            z-index: 2;
+        }
+
+        /* GÖRÜŞME BAŞLADIĞINDA: Bu class JavaScript ile eklenecek ve görüntü sağ alta küçülecek */
+        #localVideo.connected {
+            bottom: 20px; right: 20px; width: 240px; height: 140px;
+            border-radius: 12px; border: 2px solid #5f6368;
+            box-shadow: 0 12px 24px rgba(0,0,0,0.6);
+            z-index: 999; /* Karşı tarafın görüntüsünün üstünde kalması için */
+        }
+
+        #controls {
+            height: 80px; background-color: #202124; display: flex; justify-content: center; align-items: center; gap: 15px; z-index: 1000;
+        }
+        .btn {
+            background-color: #3c4043; border: none; width: 50px; height: 50px; border-radius: 50%;
+            color: white; cursor: pointer; font-size: 20px; transition: 0.3s;
+        }
+        .btn:hover { background-color: #4c5054; transform: scale(1.1); }
+        .btn.active { background-color: #ea4335; }
+        .btn.start {
+            background-color: #1a73e8; width: auto; border-radius: 25px; padding: 0 25px; font-size: 16px; font-weight: bold;
+        }
+        .status {
+            position: absolute; top: 20px; left: 20px; background: rgba(0,0,0,0.6);
+            padding: 8px 16px; border-radius: 20px; font-size: 13px; z-index: 1000;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="status" id="statusText">Durum: Bağlantı bekleniyor...</div>
+
+    <div id="video-container">
+        <video id="remoteVideo" autoplay playsinline></video>
+        <video id="localVideo" autoplay playsinline muted></video>
+    </div>
+
+    <div id="controls">
+        <button class="btn" id="micBtn" onclick="toggleMic()">🎤</button>
+        <button class="btn" id="camBtn" onclick="toggleCam()">📷</button>
+        <button class="btn start" id="callBtn" onclick="manualStart()">Aramayı Başlat</button>
+        <button class="btn active" onclick="window.location.reload()">🛑</button>
+    </div>
+
+    <script src="https://cdn.socket.io/4.0.1/socket.io.min.js"></script>
+    <script>
+        const socket = io(window.location.origin);
+        const statusText = document.getElementById("statusText");
+        const localVideo = document.getElementById("localVideo");
+        let localStream;
+        let candidateQueue = [];
+        
+
+        //WebRTC motoru başlatılır.
+        let pc = new RTCPeerConnection({
+            iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+        });
+
+        navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+        .then(stream => {
+            localStream = stream;
+            localVideo.srcObject = stream;
+            stream.getTracks().forEach(track => pc.addTrack(track, stream));
+            statusText.innerText = "Durum: Kamera Hazır";
+        });
+
+        //  Karşı tarafın görüntüsü geldiği an tetiklenir
+        pc.ontrack = event => {
+            document.getElementById("remoteVideo").srcObject = event.streams[0];
+            statusText.innerText = "Durum: Görüşme Başladı";
+            
+            //  sağ alta küçülüyor
+            localVideo.classList.add("connected");
+
+            // Görüşme başlayınca butonu yok
+    document.getElementById("callBtn").style.display = "none";
+        };
+
+        pc.onicecandidate = event => {
+            if (event.candidate) {
+                socket.emit("message", { candidate: event.candidate });
+            }
+        };
+
+        socket.on("message", async data => {
+            try {
+                if (data.offer) {
+                    if (pc.signalingState !== "stable") return;
+                    await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+                    
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    socket.emit("message", { answer: answer });
+                    processQueuedCandidates();
+                } 
+                else if (data.answer) {
+                    await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+                    processQueuedCandidates();
+                } 
+                else if (data.candidate) {
+                    if (pc.remoteDescription) {
+                        await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+                    } else {
+                        candidateQueue.push(data.candidate);
+                    }
+                }
+            } catch (err) { console.error(err); }
+        });
+
+        function processQueuedCandidates() {
+            candidateQueue.forEach(c => pc.addIceCandidate(new RTCIceCandidate(c)));
+            candidateQueue = [];
+        }
+
+        async function manualStart() {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit("message", { offer: offer });
+            statusText.innerText = "Durum: Arıyor...";
+            document.getElementById("callBtn").style.display = "none";
+        }
+
+        function toggleMic() {
+            const audioTrack = localStream.getAudioTracks()[0];
+            audioTrack.enabled = !audioTrack.enabled;
+            document.getElementById("micBtn").classList.toggle("active", !audioTrack.enabled);
+        }
+
+        function toggleCam() {
+            const videoTrack = localStream.getVideoTracks()[0];
+            videoTrack.enabled = !videoTrack.enabled;
+            document.getElementById("camBtn").classList.toggle("active", !videoTrack.enabled);
+        }
+    </script>
+</body>
+</html>
+
+
+<!-- <!DOCTYPE html>
+
+<html>
+<head>
+    <title>WebRTC Proje</title>
+</head>
+<body>
+
+<h2>Benim Kameram</h2>
+<video id="localVideo" autoplay playsinline></video>
+
+<h2>Karşı Taraf</h2>
+<video id="remoteVideo" autoplay playsinline></video>
+
+<script src="https://cdn.socket.io/4.0.1/socket.io.min.js"></script>
+
+<script>
+// window.location.origin yerine Flask'ın tam adresini yaz:
+const socket = io("http://127.0.0.1:5000");
+
+
+let localStream; // Görüntünün saklanacağı değişken 
+let pc = new RTCPeerConnection({     // WebRTC bağlantısının başlatan ana nesne.
+
+    iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    // STUN sunucu -> bilgisayarların birbirini internette bulması için
+    // kullanılan Google servisi.
+});
+
+const localVideo = document.getElementById("localVideo");
+const remoteVideo = document.getElementById("remoteVideo");
+
+// Kamera aç , burada kullanıcıdan kamera ve mikrofon izni istenir 
+navigator.mediaDevices.getUserMedia({ video: true, audio: true })
+.then(stream => {
+    localStream = stream; // Kamerayı localStream'e aktardım
+    localVideo.srcObject = stream;  // Kendi görüntümü aktardım.
+
+
+    // Bağlatnı nesnesine ekledim görüntü ve ses izlerini 
+    // Bununla karşı tarafa gönderilmeye hazır hale gelirler.
+    stream.getTracks().forEach(track => pc.addTrack(track, stream));
+});
+
+// Karşıdan gelen video
+pc.ontrack = event => {
+    remoteVideo.srcObject = event.streams[0];
+    // Gelen görüntü karşı tarafın kutusuna konulur.
+};
+
+// ICE internet üzerimden bir bağlantı yolu bulunduğunda bunu diğer 
+// kullanıcıya gönderir.
+
+pc.onicecandidate = event => {
+    if (event.candidate) {
+
+        socket.emit("message", { candidate: event.candidate });
+    }
+};
+
+// Mesaj al
+
+let candidateQueue = []; // Bekleyen adaylar için liste
+
+socket.on("message", async data => {
+    try {
+        if (data.offer) {
+            if (pc.signalingState !== "stable") return;
+            await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            socket.emit("message", { answer: answer });
+            
+            // Teklif işlendiğine göre biriken adayları ekleyebiliriz
+            processQueuedCandidates();
+        } 
+        else if (data.answer) {
+            if (pc.signalingState === "have-local-offer") {
+                await pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+                // Cevap işlendiğine göre biriken adayları ekleyebiliriz
+                processQueuedCandidates();
+            }
+        } 
+        else if (data.candidate) {
+            if (pc.remoteDescription) {
+                await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            } else {
+                // Henüz hazır değilsek adayı sıraya al, silme!
+                candidateQueue.push(data.candidate);
+            }
+        }
+    } catch (err) {
+        console.error("Bağlantı hatası:", err);
+    }
+});
+
+// Bekleyen adayları işleyen fonksiyon
+function processQueuedCandidates() {
+    candidateQueue.forEach(candidate => {
+        pc.addIceCandidate(new RTCIceCandidate(candidate));
+    });
+    candidateQueue = [];
+}
+
+
+
+
+// İlk başlatan (offer)
+async function startCall() {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    socket.emit("message", { offer: offer });
+}
+
+// 2 saniye sonra başlat
+//setTimeout(startCall, 2000);
+// sadece URL'de ?caller varsa başlat
+if (window.location.search === "?caller") {
+    setTimeout(startCall, 2000);
+}
+</script>
+
+</body>
+</html> -->
